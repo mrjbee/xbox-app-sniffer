@@ -1,0 +1,10 @@
+.dockerignore
+.env
+#Dockerfile
+#app.js
+#build-and-publish.sh
+#index.js
+node_modules/
+package-lock.json
+#package.json
+
