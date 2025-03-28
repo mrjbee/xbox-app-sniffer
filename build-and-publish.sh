@@ -1,5 +1,7 @@
 #!/bin/bash
 
+#JUST FOR AN EXAMPLE HOW TO BUILD REMOTELLY
+
 set -x
 set -e
 
