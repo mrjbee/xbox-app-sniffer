@@ -8,13 +8,13 @@ WORKDIR /usr/src/app
 COPY package*.json ./
 
 # Install any dependencies
-RUN npm install
+RUN apk add --no-cache curl \
+    && npm install
 
 # Copy the rest of the application code into the container
 COPY . .
 
-# Expose the port your app will run on (default 3000, change if needed)
-EXPOSE 3000
+# Application and health-check ports
+EXPOSE 3000 8080
 
-# Command to run your app
 CMD ["node", "app.js"]  # Adjust to the entry point of your app

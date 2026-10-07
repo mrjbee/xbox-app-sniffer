@@ -3,11 +3,23 @@ const Smartglass = require('xbox-smartglass-core-node');
 var SystemInputChannel = require('xbox-smartglass-core-node/src/channels/systeminput');
 const EventEmitter = require('events');
 const dotenv = require('dotenv');
-const app = express();
-const port = 3000;
 
 // Load environment variables
 dotenv.config();
+
+const app = express();
+const healthApp = express();
+const port = 3000;
+const configuredHealthPort = Number(process.env.HEALTH_PORT);
+const configuredHealthTtlHours = Number(process.env.HEALTH_TTL_HOURS);
+const healthPort = Number.isInteger(configuredHealthPort) && configuredHealthPort > 0 && configuredHealthPort <= 65535
+    ? configuredHealthPort
+    : 8080;
+const healthTtlHours = Number.isFinite(configuredHealthTtlHours) && configuredHealthTtlHours > 0
+    ? configuredHealthTtlHours
+    : 12;
+const maxUptimeMs = healthTtlHours * 60 * 60 * 1000;
+const startedAt = Date.now();
 
 // Store the last known apps by IP and the list of active clients
 const appMemory = {};
@@ -72,6 +84,14 @@ xboxIps.forEach(ip => {
     monitorXbox(ip);
 });
 
+// Expire after the configured TTL so Docker marks the container unhealthy and the watchdog restarts it.
+healthApp.get('/health/check', (req, res) => {
+    const expired = Date.now() - startedAt >= maxUptimeMs;
+    res.status(expired ? 503 : 200).json({
+        self: expired ? 'expired' : 'ok'
+    });
+});
+
 // Endpoint to get the currently running app for a specific Xbox IP
 app.get('/current-app', (req, res) => {
     const ip = req.query.IP;
@@ -110,8 +130,10 @@ function shutdown() {
 
     // Close the server
     server.close(() => {
-        console.log('Server has been closed');
-        process.exit(0);
+        healthServer.close(() => {
+            console.log('Servers have been closed');
+            process.exit(0);
+        });
     });
 }
 
@@ -122,4 +144,9 @@ process.on('SIGTERM', shutdown);
 // Start the server
 var server = app.listen(port, () => {
     console.log(`Server running at http://localhost:${port}`);
+});
+
+var healthServer = healthApp.listen(healthPort, () => {
+    console.log(`Health check running at http://localhost:${healthPort}/health/check`);
+    console.log(`Health check expires after ${healthTtlHours} hours`);
 });
