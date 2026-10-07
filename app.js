@@ -12,35 +12,87 @@ const healthApp = express();
 const port = 3000;
 const configuredHealthPort = Number(process.env.HEALTH_PORT);
 const configuredHealthTtlHours = Number(process.env.HEALTH_TTL_HOURS);
+const configuredConnectTimeoutMs = Number(process.env.CONNECT_TIMEOUT_MS);
+const configuredReconnectDelay = Number(process.env.RETRY_DELAY);
 const healthPort = Number.isInteger(configuredHealthPort) && configuredHealthPort > 0 && configuredHealthPort <= 65535
     ? configuredHealthPort
     : 8080;
 const healthTtlHours = Number.isFinite(configuredHealthTtlHours) && configuredHealthTtlHours > 0
     ? configuredHealthTtlHours
-    : 12;
+    : 72;
+const connectTimeoutMs = Number.isFinite(configuredConnectTimeoutMs) && configuredConnectTimeoutMs > 0
+    ? configuredConnectTimeoutMs
+    : 15 * 1000;
+const reconnectDelay = Number.isFinite(configuredReconnectDelay) && configuredReconnectDelay >= 0
+    ? configuredReconnectDelay
+    : 60 * 1000;
 const maxUptimeMs = healthTtlHours * 60 * 60 * 1000;
 const startedAt = Date.now();
 
 // Store the last known apps by IP and the list of active clients
 const appMemory = {};
 const activeClients = {};
+const pendingClients = {};
+const reconnectTimers = {};
+let shuttingDown = false;
 
 // Parse Xbox IPs from environment variable
 const xboxIps = process.env.XBOX_IPS ? process.env.XBOX_IPS.split(',') : [];
 
-const reconnectDelay = process.env.RETRY_DELAY ? process.env.RETRY_DELAY : 1 * 60 * 1000;
-
 console.log("- Retry delay is:" + reconnectDelay)
+console.log("- Connect timeout is:" + connectTimeoutMs)
 console.log("- XBOX ips:" + xboxIps)
+
+function closeClient(client) {
+    if (client) {
+        client._closeClient();
+    }
+}
+
+function scheduleReconnect(ip) {
+    if (shuttingDown || reconnectTimers[ip]) {
+        return;
+    }
+
+    reconnectTimers[ip] = setTimeout(() => {
+        delete reconnectTimers[ip];
+        monitorXbox(ip);
+    }, reconnectDelay);
+}
+
+function connectWithTimeout(client, ip) {
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            reject(new Error(`Connection to Xbox at ${ip} timed out after ${connectTimeoutMs} ms`));
+        }, connectTimeoutMs);
+
+        client.connect(ip).then(
+            () => {
+                clearTimeout(timeout);
+                resolve();
+            },
+            error => {
+                clearTimeout(timeout);
+                reject(error);
+            }
+        );
+    });
+}
 
 // Function to connect to an Xbox and monitor the running app
 function monitorXbox(ip) {
+    if (shuttingDown || pendingClients[ip] || activeClients[ip]) {
+        return;
+    }
+
     const sgClient = Smartglass();
+    pendingClients[ip] = sgClient;
 
     const customEmitter = new EventEmitter();
 
     // Try to connect to Xbox
-    sgClient.connect(ip).then(() => {
+    connectWithTimeout(sgClient, ip).then(() => {
+        delete pendingClients[ip];
         console.log(`Connected to Xbox at IP: ${ip}`);
 
         // Add system input manager
@@ -56,14 +108,15 @@ function monitorXbox(ip) {
 
         // Listen for disconnections and attempt to reconnect
         sgClient.on('_on_timeout', () => {
+            if (activeClients[ip] !== sgClient) {
+                return;
+            }
+
             console.log(`Disconnected from Xbox at IP: ${ip}`);
             delete appMemory[ip]
-            // Retry after 5 minutes
-            setTimeout(() => {
-                monitorXbox(ip);
-            }, reconnectDelay);
             delete activeClients[ip]
-            sgClient._closeClient()
+            closeClient(sgClient)
+            scheduleReconnect(ip)
             console.log(`!Disconnected from Xbox at IP: ${ip}`);
 
         });
@@ -71,11 +124,12 @@ function monitorXbox(ip) {
         activeClients[ip] = sgClient; // Track this client
 
     }).catch((err) => {
-        console.error(`Error connecting to Xbox at IP: ${ip} - ${err}`);
-        // Retry after 5 minutes if connection fails initially
-        setTimeout(() => {
-            monitorXbox(ip);
-        }, reconnectDelay);
+        if (pendingClients[ip] === sgClient) {
+            delete pendingClients[ip];
+        }
+        closeClient(sgClient);
+        console.error(`Error connecting to Xbox at IP: ${ip}`, err);
+        scheduleReconnect(ip);
     });
 }
 
@@ -121,12 +175,17 @@ app.get('/list-apps', (req, res) => {
 // Graceful shutdown on SIGINT or SIGTERM
 function shutdown() {
     console.log('Shutting down server...');
+    shuttingDown = true;
+
+    Object.values(reconnectTimers).forEach(clearTimeout);
 
     // Disconnect all active Xbox clients
     Object.entries(activeClients).forEach(([ip, client]) => {
-        client._closeClient();
+        closeClient(client);
         console.log(`Disconnected Xbox client ${ip}`);
     });
+
+    Object.values(pendingClients).forEach(closeClient);
 
     // Close the server
     server.close(() => {
